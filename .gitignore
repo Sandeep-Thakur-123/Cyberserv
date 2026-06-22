@@ -1,0 +1,57 @@
+# ============================================================
+#  .gitignore — AI Log Monitor
+#  Prevents sensitive files from being pushed to GitHub
+# ============================================================
+
+# Environment variables (contains API keys & DB passwords — NEVER commit)
+.env
+*.env
+.env.*
+.env.local
+.env.production
+
+# Mock log file (runtime artifact — not source code)
+mock_auth.log
+*.log
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+
+# Python packaging artifacts
+*.egg-info/
+dist/
+build/
+*.egg
+MANIFEST
+
+# IDE / editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# MySQL dump files (may contain data)
+*.sql
+*.dump

@@ -1,0 +1,15 @@
+# ============================================================
+#  AI-Enhanced System Log Monitor - Dependencies
+# ============================================================
+
+# MySQL database connector
+mysql-connector-python>=8.3.0
+
+# Official modern Google GenAI SDK (NOT the legacy google-generativeai)
+google-genai>=1.0.0
+
+# Load environment variables from .env file
+python-dotenv>=1.0.0
+
+# Terminal color output for beautiful CLI display
+colorama>=0.4.6
