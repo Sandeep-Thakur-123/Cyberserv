@@ -582,11 +582,13 @@ def execute_response(report: ThreatReport) -> ActionResult:
     ip = report.ip_address
 
     # ── Safety Check: Whitelist ────────────────────────────
-    if ip in WHITELIST_IPS:
-        msg = f"IP {ip} is WHITELISTED — no action taken (your safe IP)"
+    # Whitelisted IPs are NEVER blocked — but we still send email/Slack
+    # so you are always informed even during your own tests.
+    is_whitelisted = ip in WHITELIST_IPS
+    if is_whitelisted:
+        msg = f"IP {ip} is WHITELISTED — blocking skipped, sending alert only"
         result.actions_taken.append(msg)
         print(f"  {Fore.GREEN}[WHITELIST] ✅ {msg}{Style.RESET_ALL}")
-        return result
 
     print(f"\n{Fore.CYAN}{'═'*60}")
     print(f"  ⚡ AUTONOMOUS ACTION ENGINE TRIGGERED")
@@ -602,23 +604,24 @@ def execute_response(report: ThreatReport) -> ActionResult:
     if report.threat_level == "CRITICAL":
         print(f"  {Fore.RED}🔴 CRITICAL THREAT — Executing maximum response...{Style.RESET_ALL}")
 
-        # 1. Block with UFW (primary firewall)
-        _block_with_ufw(ip, result)
-        result.blocked = True
+        if not is_whitelisted:
+            # 1. Block with UFW (primary firewall)
+            _block_with_ufw(ip, result)
+            result.blocked = True
 
-        # 2. Ban with fail2ban (persistent across reboots)
-        _block_with_fail2ban(ip, result)
+            # 2. Ban with fail2ban (persistent across reboots)
+            _block_with_fail2ban(ip, result)
 
-        # 3. Block with iptables (belt-and-suspenders)
-        _block_with_iptables(ip, result)
+            # 3. Block with iptables (belt-and-suspenders)
+            _block_with_iptables(ip, result)
 
-        # 4. Kill any active sessions from this IP RIGHT NOW
-        _kill_active_sessions(ip, result)
+            # 4. Kill any active sessions from this IP RIGHT NOW
+            _kill_active_sessions(ip, result)
 
-        # 5. Send email
+        # 5. Send email (always — even for whitelisted IPs)
         _send_email_alert(report, result)
 
-        # 6. Send Slack
+        # 6. Send Slack (always)
         _send_slack_alert(report, result)
 
     # ══════════════════════════════════════════════════════
@@ -627,17 +630,18 @@ def execute_response(report: ThreatReport) -> ActionResult:
     elif report.threat_level == "HIGH":
         print(f"  {Fore.YELLOW}🟠 HIGH THREAT — Blocking IP + alerting...{Style.RESET_ALL}")
 
-        # 1. Block with UFW
-        _block_with_ufw(ip, result)
-        result.blocked = True
+        if not is_whitelisted:
+            # 1. Block with UFW
+            _block_with_ufw(ip, result)
+            result.blocked = True
 
-        # 2. Ban with fail2ban
-        _block_with_fail2ban(ip, result)
+            # 2. Ban with fail2ban
+            _block_with_fail2ban(ip, result)
 
-        # 3. Send email
+        # 3. Send email (always)
         _send_email_alert(report, result)
 
-        # 4. Send Slack
+        # 4. Send Slack (always)
         _send_slack_alert(report, result)
 
     # ══════════════════════════════════════════════════════
@@ -646,13 +650,14 @@ def execute_response(report: ThreatReport) -> ActionResult:
     elif report.threat_level == "MEDIUM":
         print(f"  {Fore.YELLOW}🟡 MEDIUM THREAT — Rate-limiting + sending alert...{Style.RESET_ALL}")
 
-        # 1. Rate limit (not full block — safer for medium threats)
-        _rate_limit_ip(ip, result)
+        if not is_whitelisted:
+            # 1. Rate limit (not full block — safer for medium threats)
+            _rate_limit_ip(ip, result)
 
-        # 2. Send email alert
+        # 2. Send email alert (always)
         _send_email_alert(report, result)
 
-        # 3. Send Slack
+        # 3. Send Slack (always)
         _send_slack_alert(report, result)
 
     # ══════════════════════════════════════════════════════
