@@ -1,42 +1,18 @@
-"""
-============================================================
- parser.py — Regex-Based SSH Log Parser
-============================================================
- Parses raw Linux SSH log lines (from /var/log/auth.log or
- mock_auth.log) and extracts structured fields.
-
- Supported event types:
-   - "Failed password"   → brute-force / bad credentials
-   - "Accepted password" → successful authentication
-   - "Accepted publickey"→ key-based login success
-   - "Invalid user"      → probe with non-existent username
-   - "Connection closed" → session end event
-   - "Disconnected"      → client disconnected
-   - "PAM"               → authentication subsystem events
-============================================================
+﻿"""
+parser.py - Regex-Based SSH Log Parser
+Supports both log formats:
+  - Classic syslog:  "Jun 22 14:32:01 host sshd[PID]: message"
+  - Ubuntu 26.04+:   "2026-06-23T12:36:10.989922+00:00 host sshd-session[PID]: message"
 """
 
 import re
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-# ── Parsed Log Result Dataclass ────────────────────────────
 
 @dataclass
 class ParsedLogEntry:
-    """
-    Represents a fully parsed SSH log line.
-
-    Attributes:
-        timestamp:    The parsed datetime object of the event.
-        ip_address:   Source IP address (IPv4 or IPv6), or None.
-        target_user:  The SSH username attempted, or None.
-        event_status: High-level event classification string.
-        port:         The source port, or None.
-        raw_log:      The original unmodified log line.
-        is_parsed:    True if at least the timestamp was matched.
-    """
     timestamp:    Optional[datetime]
     ip_address:   Optional[str]
     target_user:  Optional[str]
@@ -46,162 +22,139 @@ class ParsedLogEntry:
     is_parsed:    bool = True
 
 
-# ══════════════════════════════════════════════════════════════
-#  Compiled Regular Expressions
-# ══════════════════════════════════════════════════════════════
+# ── Timestamp Patterns ─────────────────────────────────────────────
 
-# Standard syslog timestamp prefix: "Jun 15 08:45:01"
-# Matches both single-digit and double-digit days (space-padded)
-_RE_TIMESTAMP = re.compile(
+# Format 1 - Classic syslog:  Jun 22 14:32:01
+_RE_TS_SYSLOG = re.compile(
     r"^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})"
 )
 
-# SSH daemon log line structure:
-#   "Jun 15 08:45:01 hostname sshd[PID]: MESSAGE"
-_RE_SSHD_LINE = re.compile(
-    r"^\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+sshd\[\d+\]:\s+(?P<message>.+)$"
+# Format 2 - ISO 8601 (Ubuntu 26.04):  2026-06-23T12:36:10.989922+00:00
+_RE_TS_ISO = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})T(?P<time>\d{2}:\d{2}:\d{2})"
 )
 
-# IPv4 and IPv6 address capture
+# ── SSH Line Pattern ───────────────────────────────────────────────
+# Matches both sshd[PID] and sshd-session[PID]
+_RE_SSHD_LINE = re.compile(
+    r"^\S+\s+\S+\s+sshd(?:-session)?\[\d+\]:\s+(?P<message>.+)$"
+)
+
+# ── IP Address ─────────────────────────────────────────────────────
 _RE_IP = re.compile(
     r"(?:from\s+|rhost=)(?P<ip>"
-    r"(?:\d{1,3}\.){3}\d{1,3}"           # IPv4
-    r"|(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}"  # IPv6
+    r"(?:\d{1,3}\.){3}\d{1,3}"
+    r"|(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}"
     r")"
 )
 
-# Username capture — handles both "for USER" and "for invalid user USER"
+# ── Username ───────────────────────────────────────────────────────
 _RE_USER = re.compile(
     r"for\s+(?:invalid\s+user\s+)?(?P<user>\S+)"
 )
 
-# Source port capture
+# ── Port ───────────────────────────────────────────────────────────
 _RE_PORT = re.compile(r"port\s+(?P<port>\d+)")
 
-# ── Event Classification Patterns (ordered: most specific first) ──
-_EVENT_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # Auth failures
-    (re.compile(r"Failed\s+password",          re.IGNORECASE), "Failed password"),
-    (re.compile(r"Failed\s+publickey",          re.IGNORECASE), "Failed publickey"),
-    # Auth successes
-    (re.compile(r"Accepted\s+password",         re.IGNORECASE), "Accepted password"),
-    (re.compile(r"Accepted\s+publickey",        re.IGNORECASE), "Accepted publickey"),
-    # Probe / invalid
-    (re.compile(r"Invalid\s+user",              re.IGNORECASE), "Invalid user"),
-    (re.compile(r"Did\s+not\s+receive\s+identification", re.IGNORECASE), "No identification"),
-    (re.compile(r"Bad\s+protocol\s+version",    re.IGNORECASE), "Bad protocol version"),
-    # Session lifecycle
-    (re.compile(r"Connection\s+closed",         re.IGNORECASE), "Connection closed"),
-    (re.compile(r"Disconnected\s+from",         re.IGNORECASE), "Disconnected"),
-    (re.compile(r"session\s+opened",            re.IGNORECASE), "Session opened"),
-    (re.compile(r"session\s+closed",            re.IGNORECASE), "Session closed"),
-    # Rate limiting / blocking
-    (re.compile(r"maximum\s+authentication\s+attempts\s+exceeded", re.IGNORECASE), "Max auth attempts exceeded"),
-    (re.compile(r"Received\s+disconnect",       re.IGNORECASE), "Received disconnect"),
-    # PAM subsystem
-    (re.compile(r"pam_unix",                    re.IGNORECASE), "PAM event"),
-    # CRON / sudo / su events (non-SSH but present in auth.log)
-    (re.compile(r"sudo:",                       re.IGNORECASE), "sudo event"),
-    (re.compile(r"su:",                         re.IGNORECASE), "su event"),
-    (re.compile(r"CRON",                        re.IGNORECASE), "CRON event"),
+# ── Event Classification (ordered most specific first) ─────────────
+_EVENT_PATTERNS = [
+    (re.compile(r"Failed\s+password",                  re.I), "Failed password"),
+    (re.compile(r"Failed\s+publickey",                 re.I), "Failed publickey"),
+    (re.compile(r"Accepted\s+password",                re.I), "Accepted password"),
+    (re.compile(r"Accepted\s+publickey",               re.I), "Accepted publickey"),
+    (re.compile(r"Invalid\s+user",                     re.I), "Invalid user"),
+    (re.compile(r"Did\s+not\s+receive\s+identification",re.I),"No identification"),
+    (re.compile(r"Bad\s+protocol\s+version",           re.I), "Bad protocol version"),
+    (re.compile(r"Connection\s+reset\s+by\s+invalid",  re.I), "Invalid user"),
+    (re.compile(r"Connection\s+closed",                re.I), "Connection closed"),
+    (re.compile(r"Disconnected\s+from",                re.I), "Disconnected"),
+    (re.compile(r"session\s+opened",                   re.I), "Session opened"),
+    (re.compile(r"session\s+closed",                   re.I), "Session closed"),
+    (re.compile(r"maximum\s+authentication\s+attempts", re.I),"Max auth attempts exceeded"),
+    (re.compile(r"Received\s+disconnect",              re.I), "Received disconnect"),
+    (re.compile(r"Timeout\s+before\s+authentication",  re.I), "Auth timeout"),
+    (re.compile(r"pam_unix",                           re.I), "PAM event"),
+    (re.compile(r"sudo:",                              re.I), "sudo event"),
 ]
 
-# Fallback classification for unrecognized sshd lines
 _UNKNOWN_STATUS = "Unknown SSH event"
 
 
-# ══════════════════════════════════════════════════════════════
-#  Timestamp Parser
-# ══════════════════════════════════════════════════════════════
-
 def _parse_timestamp(line: str) -> Optional[datetime]:
     """
-    Extracts and returns a datetime from the syslog timestamp prefix.
-    Uses the current year since syslog format omits the year.
-
-    Args:
-        line: The raw log line string.
-
-    Returns:
-        A datetime object, or None if no timestamp was matched.
+    Tries ISO 8601 format first (Ubuntu 26.04+),
+    then falls back to classic syslog format.
     """
-    m = _RE_TIMESTAMP.match(line)
-    if not m:
-        return None
+    # Try ISO 8601 first: 2026-06-23T12:36:10.989922+00:00
+    m = _RE_TS_ISO.match(line)
+    if m:
+        try:
+            return datetime(
+                int(m.group("year")),
+                int(m.group("month")),
+                int(m.group("day")),
+                *[int(x) for x in m.group("time").split(":")]
+            )
+        except ValueError:
+            pass
 
-    current_year = datetime.now().year
-    time_str = f"{m.group('month')} {m.group('day')} {m.group('time')} {current_year}"
-    try:
-        return datetime.strptime(time_str, "%b %d %H:%M:%S %Y")
-    except ValueError:
-        return None
+    # Fallback: classic syslog Jun 22 14:32:01
+    m = _RE_TS_SYSLOG.match(line)
+    if m:
+        try:
+            year = datetime.now().year
+            ts = f"{m.group('month')} {m.group('day')} {m.group('time')} {year}"
+            return datetime.strptime(ts, "%b %d %H:%M:%S %Y")
+        except ValueError:
+            pass
 
+    return None
 
-# ══════════════════════════════════════════════════════════════
-#  Event Classifier
-# ══════════════════════════════════════════════════════════════
 
 def _classify_event(message: str) -> str:
-    """
-    Matches the SSH message text against ordered event patterns
-    and returns the first matching classification string.
-
-    Args:
-        message: The body of the sshd log message.
-
-    Returns:
-        A human-readable event status string.
-    """
     for pattern, label in _EVENT_PATTERNS:
         if pattern.search(message):
             return label
     return _UNKNOWN_STATUS
 
 
-# ══════════════════════════════════════════════════════════════
-#  Main Parser
-# ══════════════════════════════════════════════════════════════
-
 def parse_log_line(raw_line: str) -> Optional[ParsedLogEntry]:
     """
-    Parses a single raw auth.log line into a structured ParsedLogEntry.
-
-    Args:
-        raw_line: A single line of text from the log file.
-
-    Returns:
-        A ParsedLogEntry if the line contains a parseable timestamp,
-        or None if the line is blank or completely unparseable.
+    Parses a single auth.log line into a ParsedLogEntry.
+    Returns None for blank or completely unparseable lines.
     """
     line = raw_line.strip()
     if not line:
         return None
 
-    # ── Timestamp (required field) ─────────────────────────
     timestamp = _parse_timestamp(line)
     if timestamp is None:
-        return None   # Skip non-log garbage lines
+        return None
 
-    # ── Extract SSH message body ───────────────────────────
+    # Extract SSH message body (works for both sshd and sshd-session)
     sshd_match = _RE_SSHD_LINE.match(line)
     message = sshd_match.group("message") if sshd_match else line
 
-    # ── Event Classification ───────────────────────────────
     event_status = _classify_event(message)
 
-    # ── IP Address ─────────────────────────────────────────
-    ip_match  = _RE_IP.search(message)
+    ip_match   = _RE_IP.search(message)
     ip_address = ip_match.group("ip") if ip_match else None
 
-    # ── Username ───────────────────────────────────────────
-    user_match   = _RE_USER.search(message)
-    target_user  = user_match.group("user") if user_match else None
+    # Also try to grab IP from "Connection reset by invalid user X IP port Y"
+    if not ip_address:
+        m = re.search(r"invalid user \S+ (\d{1,3}(?:\.\d{1,3}){3})", message, re.I)
+        if m:
+            ip_address = m.group(1)
 
-    # Sanitize: reject false positives like "authenticating" / "auth"
-    if target_user and (len(target_user) > 32 or not re.match(r"^[a-zA-Z0-9_.\-@]+$", target_user)):
+    user_match  = _RE_USER.search(message)
+    target_user = user_match.group("user") if user_match else None
+
+    if target_user and (
+        len(target_user) > 32
+        or not re.match(r"^[a-zA-Z0-9_.\-@]+$", target_user)
+    ):
         target_user = None
 
-    # ── Port ───────────────────────────────────────────────
     port_match = _RE_PORT.search(message)
     port       = port_match.group("port") if port_match else None
 
@@ -217,49 +170,39 @@ def parse_log_line(raw_line: str) -> Optional[ParsedLogEntry]:
 
 
 def is_failure_event(entry: ParsedLogEntry) -> bool:
-    """
-    Returns True if the log entry represents a failed or suspicious
-    authentication attempt that should count toward the anomaly threshold.
-
-    Args:
-        entry: A ParsedLogEntry object.
-
-    Returns:
-        True for failure-class events, False for benign events.
-    """
-    failure_statuses = {
+    """Returns True for events that count toward anomaly threshold."""
+    return entry.event_status in {
         "Failed password",
         "Failed publickey",
         "Invalid user",
         "No identification",
         "Bad protocol version",
         "Max auth attempts exceeded",
+        "Auth timeout",
     }
-    return entry.event_status in failure_statuses
 
 
-# ── Manual test entry point ────────────────────────────────
+# ── Self-test ──────────────────────────────────────────────────────
 if __name__ == "__main__":
-    test_lines = [
-        "Jun 22 14:32:01 server sshd[9421]: Failed password for root from 203.0.113.42 port 51234 ssh2",
-        "Jun 22 14:32:05 server sshd[9422]: Invalid user admin from 203.0.113.42 port 51235",
-        "Jun 22 14:33:00 server sshd[9450]: Accepted password for deploy from 10.0.0.5 port 22 ssh2",
-        "Jun 22 14:33:01 server sshd[9451]: session opened for user deploy by (uid=0)",
-        "Jun 22 14:33:10 server sshd[9460]: Failed password for invalid user oracle from 198.51.100.7 port 44100 ssh2",
-        "Jun 22 14:34:00 server sshd[9470]: Disconnected from 203.0.113.42 port 51234 [preauth]",
-        "",                   # blank line — should return None
-        "Not a log line",     # garbage — should return None
+    tests = [
+        # Ubuntu 26.04 ISO format with sshd-session
+        '2026-06-23T12:36:10.989922+00:00 ip-172-31-45-128 sshd-session[13937]: Invalid user wronguser from 49.156.88.143 port 59501',
+        '2026-06-23T12:36:11.030023+00:00 ip-172-31-45-128 sshd-session[13937]: Connection reset by invalid user wronguser 49.156.88.143 port 59501 [preauth]',
+        '2026-06-23T12:47:11.695767+00:00 ip-172-31-45-128 sshd-session[13979]: Accepted publickey for ubuntu from 13.233.177.5 port 59120 ssh2',
+        # Classic syslog format
+        'Jun 22 14:32:01 server sshd[9421]: Failed password for root from 203.0.113.42 port 51234 ssh2',
+        'Jun 22 14:32:05 server sshd[9422]: Invalid user admin from 203.0.113.42 port 51235',
     ]
 
-    print("=" * 60)
-    print("  Parser Self-Test")
-    print("=" * 60)
-    for raw in test_lines:
+    print("=" * 65)
+    print("  Parser Self-Test — Ubuntu 26.04 + Classic formats")
+    print("=" * 65)
+    for raw in tests:
         result = parse_log_line(raw)
         if result:
-            print(f"  ✓ [{result.event_status}]")
-            print(f"    IP={result.ip_address}  User={result.target_user}  Port={result.port}")
-            print(f"    Time={result.timestamp}")
+            status = "FAILURE" if is_failure_event(result) else "normal"
+            print(f"  OK  [{result.event_status}] ({status})")
+            print(f"      IP={result.ip_address}  User={result.target_user}")
         else:
-            print(f"  ✗ Skipped: {repr(raw[:50])}")
+            print(f"  SKIP: {raw[:60]}")
         print()
